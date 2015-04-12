@@ -42,6 +42,9 @@
 #ifdef HAVE_PRCTL
 # include <sys/prctl.h>
 #endif
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 #include "ptrace.h"
 
@@ -78,7 +81,7 @@ const unsigned int syscall_trap_sig = SIGTRAP | 0x80;
 
 cflag_t cflag = CFLAG_NONE;
 unsigned int followfork = 0;
-unsigned int ptrace_setoptions = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
+unsigned int ptrace_setoptions = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC | PTRACE_O_TRACESECCOMP;
 unsigned int xflag = 0;
 bool debug_flag = 0;
 bool Tflag = 0;
@@ -88,6 +91,7 @@ unsigned int qflag = 0;
 static unsigned int tflag = 0;
 static bool rflag = 0;
 static bool print_pid_pfx = 0;
+static bool use_seccomp = 0;
 
 /* -I n */
 enum {
@@ -208,6 +212,7 @@ usage: strace [-CdffhiqrtttTvVxxy] [-I n] [-e expr]...\n\
 -d -- enable debug output to stderr\n\
 -D -- run tracer process as a detached grandchild, not as parent\n\
 -f -- follow forks, -ff -- with output into separate files\n\
+-F -- use seccomp-based instrumentation to lower overhead\n\
 -i -- print instruction pointer at time of syscall\n\
 -q -- suppress messages about attaching, detaching, etc.\n\
 -r -- print relative timestamp, -t -- absolute timestamp, -tt -- with usecs\n\
@@ -241,9 +246,6 @@ usage: strace [-CdffhiqrtttTvVxxy] [-I n] [-e expr]...\n\
 "-k obtain stack trace between each syscall (experimental)\n\
 "
 #endif
-/* ancient, no one should use it
--F -- attempt to follow vforks (deprecated, use -f)\n\
- */
 /* this is broken, so don't document it
 -z -- print only succeeding syscalls\n\
  */
@@ -1148,6 +1150,53 @@ exec_or_die(void)
 		alarm(0);
 	}
 
+	if (use_seccomp) {
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0) != 0) {
+			perror_msg_and_die("prctl PR_SET_NO_NEW_PRIVS");
+		}
+
+		struct sock_fprog fprog = {
+			.len = 0,
+			// maximum possible size is 5 constant ops, plus 2 for each syscall
+			.filter = malloc(sizeof(struct sock_filter) * (5 + 2 * num_quals)),
+		};
+
+		fprog.filter[fprog.len++] = ((struct sock_filter)
+				// Load syscall architecture
+				BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
+		fprog.filter[fprog.len++] = ((struct sock_filter)
+				// if AUDIT_ARCH_X86_64, skip one
+				BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0));
+		fprog.filter[fprog.len++] = ((struct sock_filter)
+				// trace it (just in case)
+				BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));
+		fprog.filter[fprog.len++] = ((struct sock_filter)
+				// Load syscall number
+				BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
+
+		unsigned qual;
+		for (qual = 0; qual < num_quals; qual++) {
+			if (qual_vec[0][qual] & QUAL_TRACE) {
+				fprog.filter[fprog.len++] = ((struct sock_filter)
+						// if it is a syscall we're interested in
+						BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, qual, 0, 1));
+				fprog.filter[fprog.len++] = ((struct sock_filter)
+						// report a PTRACE_EVENT_SECCOMP
+						BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE));
+			}
+		}
+
+		fprog.filter[fprog.len++] = ((struct sock_filter)
+				// permit the call without stopping
+				BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+
+		if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0) != 0) {
+			free(fprog.filter);
+			perror_msg_and_die("prctl PR_SET_SECCOMP");
+		}
+		free(fprog.filter);
+	}
+
 	execv(params->pathname, params->argv);
 	perror_msg_and_die("exec");
 }
@@ -1425,7 +1474,6 @@ init(int argc, char *argv[])
 {
 	struct tcb *tcp;
 	int c, i;
-	int optF = 0;
 	unsigned int tcbi;
 	struct sigaction sa;
 
@@ -1496,7 +1544,7 @@ init(int argc, char *argv[])
 			daemonized_tracer = 1;
 			break;
 		case 'F':
-			optF = 1;
+			use_seccomp = 1;
 			break;
 		case 'f':
 			followfork++;
@@ -1609,9 +1657,6 @@ init(int argc, char *argv[])
 		error_msg_and_die("-D and -p are mutually exclusive");
 	}
 
-	if (!followfork)
-		followfork = optF;
-
 	if (followfork >= 2 && cflag) {
 		error_msg_and_die("(-c or -C) and -ff are mutually exclusive");
 	}
@@ -1635,6 +1680,14 @@ init(int argc, char *argv[])
 			error_msg("-%c has no effect with -c", 'T');
 		if (show_fd_path)
 			error_msg("-%c has no effect with -c", 'y');
+	}
+
+	if (use_seccomp && !followfork) {
+		error_msg_and_die("-F must be given with -f");
+	}
+
+	if (use_seccomp && detach_on_execve) {
+		error_msg_and_die("-F and -b are mutually exclusive");
 	}
 
 #ifdef USE_LIBUNWIND
@@ -1719,8 +1772,16 @@ init(int argc, char *argv[])
 	 * in the startup_child() mode we kill the spawned process anyway.
 	 */
 	if (argv[0]) {
-		if (!NOMMU_SYSTEM || daemonized_tracer)
-			hide_log_until_execve = 1;
+		if (!NOMMU_SYSTEM || daemonized_tracer) {
+			if (!use_seccomp ||
+			    (  qual_vec[0][__NR_execve] & QUAL_TRACE
+# if defined(SPARC) || defined(SPARC64)
+			    || qual_vec[0][__NR_execv] & QUAL_TRACE
+# endif
+			    )) {
+				hide_log_until_execve = 1;
+			}
+		}
 		skip_one_b_execve = 1;
 		startup_child(argv);
 	}
@@ -2041,6 +2102,7 @@ trace(void)
 	unsigned int event;
 	struct tcb *tcp;
 	struct rusage ru;
+	enum __ptrace_request ptrace_request = PTRACE_SYSCALL;
 
 	if (interrupted)
 		return false;
@@ -2157,6 +2219,16 @@ trace(void)
 
 	sig = WSTOPSIG(status);
 
+	if (event == PTRACE_EVENT_SECCOMP) {
+		/* Both the syscall-entry and syscall-exit stops are
+		 * pending at this point. While we could decode now and
+		 * skip the syscall-entry event, it's less bookkeeping
+		 * to skip this event and decode on syscall-entry like
+		 * normal.
+		 */
+		goto restart_tracee_with_sig_0;
+	}
+
 	if (event != 0) {
 		/* Ptrace event */
 #if USE_SEIZE
@@ -2256,7 +2328,12 @@ restart_tracee_with_sig_0:
 	sig = 0;
 
 restart_tracee:
-	if (ptrace_restart(PTRACE_SYSCALL, tcp, sig) < 0) {
+	if (use_seccomp && event != PTRACE_EVENT_SECCOMP && entering(tcp)) {
+		/* SECCOMP_RET_TRACE will send us a seccomp event before
+		 * the next system call we care about */
+		ptrace_request = PTRACE_CONT;
+	}
+	if (ptrace_restart(ptrace_request, tcp, sig) < 0) {
 		/* Note: ptrace_restart emitted error message */
 		exit_code = 1;
 		return false;
